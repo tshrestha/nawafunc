@@ -22,7 +22,6 @@ var (
 			MaxIdleConns:        100,              // Max total idle connections
 			MaxIdleConnsPerHost: 20,               // Max idle connections per host
 			IdleConnTimeout:     15 * time.Minute, // How long an idle connection stays open
-
 		},
 	}
 	redisClient = redis.NewClient(&redis.Options{
@@ -40,6 +39,7 @@ var (
 	searchURL        = "https://api.mapbox.com/search/geocode/v6"
 	forwardSearchURL = searchURL + "/forward?country=us&types=place&access_token=" + os.Getenv("mapbox_access_token")
 	reverseSearchURL = searchURL + "/reverse?country=us&types=place&access_token=" + os.Getenv("mapbox_access_token")
+	nawaToken        = os.Getenv("nawa_token")
 )
 
 const (
@@ -151,6 +151,13 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*event
 	logger.InfoContext(ctx, "received request", slog.String("method", request.HTTPMethod), slog.String("path", request.Path))
 
 	origin := request.Headers["Origin"]
+	tokenHeader := request.Headers["X-Nawa-Token"]
+	if tokenHeader != nawaToken || (origin != localhostOrigin && origin != githubOrigin) {
+		return &events.APIGatewayProxyResponse{
+			StatusCode: http.StatusUnauthorized,
+		}, nil
+	}
+
 	if request.HTTPMethod == http.MethodOptions && origin == localhostOrigin || origin == githubOrigin {
 		corsHeaders["Access-Control-Allow-Origin"] = origin
 
