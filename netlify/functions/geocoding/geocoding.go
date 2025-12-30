@@ -2,17 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/paulmach/orb/geojson"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,8 +36,10 @@ var (
 		"Access-Control-Allow-Headers": "*",
 		"Access-Control-Allow-Methods": "*",
 	}
-	logger             = slog.New(slog.NewTextHandler(os.Stdout, nil))
-	mapboxGeocodingURL = "https://api.mapbox.com/search/geocode/v6/forward?country=us&types=place&access_token=" + os.Getenv("mapbox_access_token")
+	logger           = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	searchURL        = "https://api.mapbox.com/search/geocode/v6"
+	forwardSearchURL = searchURL + "/forward?country=us&types=place&access_token=" + os.Getenv("mapbox_access_token")
+	reverseSearchURL = searchURL + "/reverse?country=us&types=place&access_token=" + os.Getenv("mapbox_access_token")
 )
 
 const (
@@ -46,15 +47,32 @@ const (
 	githubOrigin    = "https://tshrestha.github.io"
 )
 
-func geocoding(ctx context.Context, query string) (string, error) {
-	reqURL := mapboxGeocodingURL + "&q=" + query
+func getCached(ctx context.Context, key string) string {
+	cached, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		logger.WarnContext(ctx, "failed to retrieve query result from cache", slog.String("query", key), slog.Any("error", err))
+		logger.InfoContext(ctx, "HTTP request is required to fetch query results", slog.String("query", key))
+		return ""
+	}
+
+	return cached
+}
+
+func setCache(ctx context.Context, key, value string) {
+	err := redisClient.Set(ctx, key, value, 200*time.Hour).Err()
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to JSONSet forwardSearch result", slog.Any("error", err))
+	}
+}
+
+func search(ctx context.Context, reqURL string) (string, error) {
 	req, _ := http.NewRequest(http.MethodGet, reqURL, nil)
 	req.Header.Set("Origin", "https://tshrestha.github.io")
 	req.Header.Set("Referer", "https://tshrestha.github.io/nawa")
 
 	res, err := httpClient.Do(req)
 	if err != nil {
-		logger.ErrorContext(ctx, "geocoding request failed", slog.Any("error", err))
+		logger.ErrorContext(ctx, "request failed", slog.String("reqURL", reqURL), slog.Any("error", err))
 		return "", err
 	}
 	defer res.Body.Close()
@@ -62,27 +80,71 @@ func geocoding(ctx context.Context, query string) (string, error) {
 	if res.StatusCode == http.StatusOK {
 		body, err := io.ReadAll(res.Body)
 		if err != nil {
-			logger.ErrorContext(ctx, "failed to read response body", slog.Any("error", err))
+			logger.ErrorContext(ctx, "failed to read response body", slog.String("reqURL", reqURL), slog.Any("error", err))
 			return "", err
-		}
-
-		var featureCollection geojson.FeatureCollection
-		err = json.Unmarshal(body, &featureCollection)
-		if err != nil {
-			logger.ErrorContext(ctx, "failed to unmarshall geocoding result", slog.Any("error", err))
-		}
-
-		err = redisClient.JSONSet(ctx, query, "$", featureCollection).Err()
-		if err != nil {
-			logger.ErrorContext(ctx, "failed to JSONSet geocoding result", slog.Any("error", err))
 		}
 
 		return string(body), nil
 	}
 
 	err = fmt.Errorf("received unexpected status code %d", res.StatusCode)
-	logger.ErrorContext(ctx, "received unexpected status code", slog.Int("statusCode", res.StatusCode))
+	logger.ErrorContext(ctx, "received unexpected status code", slog.String("reqURL", reqURL), slog.Int("statusCode", res.StatusCode))
 	return "", err
+}
+
+func forwardSearch(ctx context.Context, query string) *events.APIGatewayProxyResponse {
+	cached := getCached(ctx, query)
+
+	if cached == "" {
+		reqURL := forwardSearchURL + "&q=" + query
+		result, err := search(ctx, reqURL)
+		if err != nil {
+			return &events.APIGatewayProxyResponse{
+				StatusCode: http.StatusInternalServerError,
+				Body:       err.Error(),
+			}
+		}
+
+		setCache(ctx, query, result)
+		return &events.APIGatewayProxyResponse{
+			StatusCode: http.StatusOK,
+			Body:       result,
+		}
+	}
+
+	logger.InfoContext(ctx, "retrieved result from cache", slog.String("key", query))
+	return &events.APIGatewayProxyResponse{
+		StatusCode: http.StatusOK,
+		Body:       cached,
+	}
+}
+
+func reverseSearch(ctx context.Context, lat, lon string) *events.APIGatewayProxyResponse {
+	key := lat + lon
+	cached := getCached(ctx, key)
+
+	if cached == "" {
+		reqURL := reverseSearchURL + "&latitude=" + lat + "&longitude=" + lon
+		result, err := search(ctx, reqURL)
+		if err != nil {
+			return &events.APIGatewayProxyResponse{
+				StatusCode: http.StatusInternalServerError,
+				Body:       err.Error(),
+			}
+		}
+
+		setCache(ctx, key, result)
+		return &events.APIGatewayProxyResponse{
+			StatusCode: http.StatusOK,
+			Body:       result,
+		}
+	}
+
+	logger.InfoContext(ctx, "retrieved result from cache", slog.String("key", key))
+	return &events.APIGatewayProxyResponse{
+		StatusCode: http.StatusOK,
+		Body:       cached,
+	}
 }
 
 func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error) {
@@ -99,31 +161,17 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*event
 	}
 
 	if request.HTTPMethod == http.MethodGet {
-		query := request.QueryStringParameters["q"]
-		cached, err := redisClient.JSONGet(ctx, query, "$").Result()
+		pathSegments := strings.Split(request.Path, "/")
+		requestType := pathSegments[len(pathSegments)-1]
 
-		if err != nil {
-			logger.WarnContext(ctx, "failed to retrieve query result from cache", slog.String("query", query), slog.Any("error", err))
-			logger.InfoContext(ctx, "HTTP request is required to fetch query results", slog.String("query", query))
-
-			result, err := geocoding(ctx, query)
-			if err != nil {
-				return &events.APIGatewayProxyResponse{
-					StatusCode: http.StatusInternalServerError,
-					Body:       err.Error(),
-				}, nil
-			}
-
-			return &events.APIGatewayProxyResponse{
-				StatusCode: http.StatusOK,
-				Body:       result,
-			}, nil
+		if requestType == "forward" {
+			return forwardSearch(ctx, request.QueryStringParameters["q"]), nil
+		} else if requestType == "reverse" {
+			return reverseSearch(ctx, request.QueryStringParameters["lat"], request.QueryStringParameters["lon"]), nil
 		}
 
-		logger.InfoContext(ctx, "retrieve query result from cache", slog.String("query", query))
 		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusOK,
-			Body:       cached,
+			StatusCode: http.StatusNotFound,
 		}, nil
 	}
 
