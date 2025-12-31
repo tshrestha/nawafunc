@@ -31,7 +31,7 @@ var (
 		DB:       0,
 	})
 	corsHeaders = map[string]string{
-		"Access-Control-Allow-Origin":  "",
+		"Access-Control-Allow-Origin":  "http://localhost:3000",
 		"Access-Control-Allow-Headers": "*",
 		"Access-Control-Allow-Methods": "*",
 	}
@@ -46,6 +46,19 @@ const (
 	localhostOrigin = "http://localhost:3000"
 	githubOrigin    = "https://tshrestha.github.io"
 )
+
+func createResponse(req *events.APIGatewayProxyRequest, statusCode int, body string) *events.APIGatewayProxyResponse {
+	origin := req.Headers["Origin"]
+	if origin == localhostOrigin || origin == githubOrigin {
+		corsHeaders["Access-Control-Allow-Origin"] = req.Headers["Origin"]
+	}
+
+	return &events.APIGatewayProxyResponse{
+		StatusCode: statusCode,
+		Body:       body,
+		Headers:    corsHeaders,
+	}
+}
 
 func getCached(ctx context.Context, key string) string {
 	cached, err := redisClient.Get(ctx, key).Result()
@@ -92,34 +105,25 @@ func search(ctx context.Context, reqURL string) (string, error) {
 	return "", err
 }
 
-func forwardSearch(ctx context.Context, query string) *events.APIGatewayProxyResponse {
+func forwardSearch(ctx context.Context, req *events.APIGatewayProxyRequest, query string) *events.APIGatewayProxyResponse {
 	cached := getCached(ctx, query)
 
 	if cached == "" {
 		reqURL := forwardSearchURL + "&q=" + query
 		result, err := search(ctx, reqURL)
 		if err != nil {
-			return &events.APIGatewayProxyResponse{
-				StatusCode: http.StatusInternalServerError,
-				Body:       err.Error(),
-			}
+			return createResponse(req, http.StatusInternalServerError, err.Error())
 		}
 
 		setCache(ctx, query, result)
-		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusOK,
-			Body:       result,
-		}
+		return createResponse(req, http.StatusOK, result)
 	}
 
 	logger.InfoContext(ctx, "retrieved result from cache", slog.String("key", query))
-	return &events.APIGatewayProxyResponse{
-		StatusCode: http.StatusOK,
-		Body:       cached,
-	}
+	return createResponse(req, http.StatusOK, cached)
 }
 
-func reverseSearch(ctx context.Context, lat, lon string) *events.APIGatewayProxyResponse {
+func reverseSearch(ctx context.Context, req *events.APIGatewayProxyRequest, lat, lon string) *events.APIGatewayProxyResponse {
 	key := lat + lon
 	cached := getCached(ctx, key)
 
@@ -127,44 +131,30 @@ func reverseSearch(ctx context.Context, lat, lon string) *events.APIGatewayProxy
 		reqURL := reverseSearchURL + "&latitude=" + lat + "&longitude=" + lon
 		result, err := search(ctx, reqURL)
 		if err != nil {
-			return &events.APIGatewayProxyResponse{
-				StatusCode: http.StatusInternalServerError,
-				Body:       err.Error(),
-			}
+			return createResponse(req, http.StatusInternalServerError, err.Error())
 		}
 
 		setCache(ctx, key, result)
-		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusOK,
-			Body:       result,
-		}
+		return createResponse(req, http.StatusOK, result)
 	}
 
 	logger.InfoContext(ctx, "retrieved result from cache", slog.String("key", key))
-	return &events.APIGatewayProxyResponse{
-		StatusCode: http.StatusOK,
-		Body:       cached,
-	}
+	return createResponse(req, http.StatusOK, cached)
 }
 
 func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error) {
 	logger.InfoContext(ctx, "received request", slog.String("method", request.HTTPMethod), slog.String("path", request.Path))
 
 	origin := request.Headers["Origin"]
-	tokenHeader := request.Headers["X-Nawa-Token"]
-	if tokenHeader != nawaToken || (origin != localhostOrigin && origin != githubOrigin) {
-		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusUnauthorized,
-		}, nil
-	}
+	//tokenHeader := request.Headers["X-Nawa-Token"]
+	//if tokenHeader != nawaToken || (origin != localhostOrigin && origin != githubOrigin) {
+	//	return &events.APIGatewayProxyResponse{
+	//		StatusCode: http.StatusUnauthorized,
+	//	}, nil
+	//}
 
 	if request.HTTPMethod == http.MethodOptions && origin == localhostOrigin || origin == githubOrigin {
-		corsHeaders["Access-Control-Allow-Origin"] = origin
-
-		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusOK,
-			Headers:    corsHeaders,
-		}, nil
+		return createResponse(&request, http.StatusOK, ""), nil
 	}
 
 	if request.HTTPMethod == http.MethodGet {
@@ -172,19 +162,15 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*event
 		requestType := pathSegments[len(pathSegments)-1]
 
 		if requestType == "forward" {
-			return forwardSearch(ctx, request.QueryStringParameters["q"]), nil
+			return forwardSearch(ctx, &request, request.QueryStringParameters["q"]), nil
 		} else if requestType == "reverse" {
-			return reverseSearch(ctx, request.QueryStringParameters["lat"], request.QueryStringParameters["lon"]), nil
+			return reverseSearch(ctx, &request, request.QueryStringParameters["lat"], request.QueryStringParameters["lon"]), nil
 		}
 
-		return &events.APIGatewayProxyResponse{
-			StatusCode: http.StatusNotFound,
-		}, nil
+		return createResponse(&request, http.StatusNotFound, ""), nil
 	}
 
-	return &events.APIGatewayProxyResponse{
-		StatusCode: http.StatusMethodNotAllowed,
-	}, nil
+	return createResponse(&request, http.StatusMethodNotAllowed, ""), nil
 }
 
 func main() {
