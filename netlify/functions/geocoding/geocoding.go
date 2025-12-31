@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -167,29 +166,18 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (*event
 			}
 			logger.Info("token header is present", slog.String("token", token))
 
-			if validatedClientToken == "" {
-				decoded, err := hex.DecodeString(token)
-				if err != nil {
-					logger.ErrorContext(ctx, "failed to decode client token", slog.Any("error", err))
-					return createResponse(&request, http.StatusInternalServerError, ""), nil
-				}
-
-				decrypted, err := internal.Decrypt([]byte(nawaKey), decoded)
-				if err != nil {
-					logger.Error("failed to decrypt token", slog.Any("error", err))
-					return createResponse(&request, http.StatusInternalServerError, ""), nil
-				}
-
-				if string(decrypted) != nawaToken {
-					logger.Error("decrypted client token does not match server token")
-					return createResponse(&request, http.StatusUnauthorized, "invalid token"), nil
-				}
-
-				logger.Info("client token validated successfully")
-				validatedClientToken = token
-			} else {
-				logger.Info("validated client token exists")
+			decrypted, err := internal.Decrypt(token, []byte(nawaKey))
+			if err != nil {
+				logger.Error("failed to decrypt token", slog.Any("error", err))
+				return createResponse(&request, http.StatusInternalServerError, ""), nil
 			}
+
+			if string(decrypted) != nawaToken {
+				logger.Error("decrypted client token does not match server token")
+				return createResponse(&request, http.StatusUnauthorized, "invalid token"), nil
+			}
+
+			logger.Info("client token validated successfully")
 		}
 
 		pathSegments := strings.Split(request.Path, "/")

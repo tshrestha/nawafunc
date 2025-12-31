@@ -4,84 +4,64 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-
-	"golang.org/x/crypto/scrypt"
+	"encoding/base64"
+	"errors"
+	"io"
 )
 
-/*
-https://bruinsslot.jp/post/golang-crypto/
-*/
-
-const keylen = 16
-
-func Encrypt(key, data []byte) ([]byte, error) {
-	key, salt, err := DeriveKey(key, nil)
+func Encrypt(plaintext []byte, key []byte) (string, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	blockCipher, err := aes.NewCipher(key)
+	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	gcm, err := cipher.NewGCM(blockCipher)
-	if err != nil {
-		return nil, err
+	// 1. Allocate a single buffer for [nonce + ciphertext + tag]
+	rawSize := gcm.NonceSize() + len(plaintext) + 16 // 16 is standard GCM tag size
+	out := make([]byte, rawSize)
+
+	// 2. Generate Nonce directly into the start of the buffer
+	nonce := out[:gcm.NonceSize()]
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
 	}
 
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = rand.Read(nonce); err != nil {
-		return nil, err
-	}
+	// 3. Encrypt directly into the remainder of the buffer
+	// Seal(dst, nonce, plaintext, data) -> appends to dst
+	gcm.Seal(out[:gcm.NonceSize()], nonce, plaintext, nil)
 
-	ciphertext := gcm.Seal(nonce, nonce, data, nil)
-
-	ciphertext = append(ciphertext, salt...)
-
-	return ciphertext, nil
+	// 4. Encode to Base64 string
+	return base64.RawURLEncoding.EncodeToString(out), nil
 }
 
-func Decrypt(key, data []byte) ([]byte, error) {
-	salt, data := data[len(data)-keylen:], data[:len(data)-keylen]
-
-	key, _, err := DeriveKey(key, salt)
+func Decrypt(cryptoText string, key []byte) ([]byte, error) {
+	// 1. Decode Base64 string back to bytes
+	data, err := base64.RawURLEncoding.DecodeString(cryptoText)
 	if err != nil {
 		return nil, err
 	}
 
-	blockCipher, err := aes.NewCipher(key)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 
-	gcm, err := cipher.NewGCM(blockCipher)
+	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, err
 	}
 
-	nonce, ciphertext := data[:gcm.NonceSize()], data[gcm.NonceSize():]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, err
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize {
+		return nil, errors.New("ciphertext too short")
 	}
 
-	return plaintext, nil
-}
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
 
-func DeriveKey(password, salt []byte) ([]byte, []byte, error) {
-	if salt == nil {
-		salt = make([]byte, keylen)
-		if _, err := rand.Read(salt); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	key, err := scrypt.Key(password, salt, 1048576, 8, 1, keylen)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return key, salt, nil
+	// 2. Decrypt in-place using the decoded buffer to save memory
+	return gcm.Open(ciphertext[:0], nonce, ciphertext, nil)
 }

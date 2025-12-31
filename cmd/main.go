@@ -1,26 +1,20 @@
 package main
 
 import (
-	"encoding/hex"
 	"fmt"
-	"log"
 	"nawa-functions/internal"
 )
 
 func main() {
-	key := []byte("key")
-	data := []byte("dat")
+	key := []byte("")
+	data := []byte("")
 
-	ciphertext, err := internal.Encrypt(key, data)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("ciphertext: %s\n", hex.EncodeToString(ciphertext))
+	// Encrypt
+	encrypted, _ := internal.Encrypt(data, key)
+	fmt.Printf("Encrypted: %s\n", encrypted)
 
-	plaintext, err := internal.Decrypt(key, ciphertext)
-	if err != nil {
-		log.Fatal(err)
-	}
+	//Decrypt
+	decrypted, _ := internal.Decrypt(encrypted, key)
 
-	fmt.Printf("plaintext: %s\n", plaintext)
+	fmt.Printf("Decrypted: %s\n", string(decrypted))
 }
